@@ -638,3 +638,57 @@ generateProposedGrid <- function(current_grid, recommendedChanges){
   return(proposed_grid)
 }
 
+# Function 11
+#' @examples
+#'
+#' benchmarkPricesAgainstControl(target_date = "2017-07-02",
+#'                               weeksHistory = 8,
+#'                               test_stores = c(2243, 53, 2331, 3, 426),
+#'                               control_stores = c(2050, 886, 2268, 2175, 2286),
+#'                               output_dir = "C:/temp/",
+#'                               excludeDates = c("2017-07-01"))
+#'
+#' @export
+
+benchmarkPricesAgainstControl <- function(target_date, weeksHistory = 4, test_stores = NULL, control_stores = NULL, output_dir = NULL, excludeDates = NULL, showDashboard = TRUE){
+
+  # Validate targetDate
+  target_date <- validateTargetDate(target_date)
+
+  if(is.null(output_dir)){
+    stop("Please provide a valid file path to save the dashboard.")
+  } else {
+    # Create the save path if it doesn't exist.
+    dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  }
+
+  # Validate provided stores ids to match the in-package stores
+  if(is.null(test_stores) | !all(test_stores %in% OnlineStoreClusters$STORE_NUM)){
+    stop("Invalid / Unknown test stores provided.")
+  }
+
+  # Validate provided stores ids to match the in-package stores
+  if(is.null(control_stores) | !all(control_stores %in% OnlineStoreClusters$STORE_NUM)){
+    stop("Invalid / Unknown control stores provided.")
+  }
+
+  # Get the aggregated order data from the database for both test and control
+  order_data <- getOrderData(target_date - weeksHistory * 7, target_date - 1, c(test_stores, control_stores))
+
+  # Show msg for user on terminal
+  print("Analysing Data & Generating Dashboard...")
+
+  # Render the Markdown file with the downloaded data
+  rmarkdown::render(system.file("rmd/benchmarkPerformanceAgainstControl.Rmd", package="JSSlotPricing"),
+                    params = list(order_data = order_data, test_stores = test_stores, control_stores = control_stores),
+                    clean = TRUE, quiet = TRUE, output_dir = output_dir)
+
+  # Open dashboard in the default web browser
+  if(showDashboard){
+    browseURL(paste0(output_dir,"benchmarkPerformanceAgainstControl.html"))
+  }
+
+  # Display the dashboard path on the terminal
+  print(paste0("The dashboard can be located at: ",output_dir,"benchmarkPerformanceAgainstControl.html"))
+
+}
