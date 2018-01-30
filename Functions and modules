@@ -1,0 +1,640 @@
+##Load the required libraries
+library(data.table)
+library(isotone)
+library(RODBC)
+library(lubridate)
+library(tools)
+library(plotly)
+library(ggplot2)
+library(plotly)
+library(flexdashboard)
+library(gridExtra)
+
+# Function 0
+validateTargetDate <- function(target_date){
+
+  # Check for invalid date format
+  d <- try( as.Date( target_date, format= "%Y-%m-%d" ) )
+  if( class( d ) == "try-error" || is.na( d ) ){
+    stop("Invalid date provided. Please use the format: YYYY-MM-DD.")
+  }
+
+  target_date <- as.Date(target_date)
+
+  # Check for future date and move to the nearest start of the week
+  if(target_date > (Sys.Date() + 7)){
+    target_date <- as.character(lubridate::floor_date(Sys.Date(), unit = "week"))
+    warning(paste0("Provided target date more than a week away. Moving the target date to the nearest Sunday: ", target_date))
+    return(as.Date(target_date))
+  }
+
+  # Check if target date is not Sunday
+  estimated_date <- lubridate::floor_date(target_date, unit = "week")
+  if(estimated_date != target_date){
+    warning(paste0("Provided target date is not mapping to a start of the week. Rolling target date to the last Sunday: ", estimated_date))
+    return(as.Date(estimated_date))
+  }
+
+  return(as.Date(target_date))
+}
+
+
+
+## Function 1
+#' Extract the aggregated hourly order data from the XXX database
+#'
+#' A function to retreive the aggregated hourly customer order data from the XXX database for the provided period and stores.
+#'
+#' @param startDate The start date in string YYYY-MM-DD format that we want to extract data for.
+#'
+#' @param endDate The end date in string YYYY-MM-DD format that we want to extract data for.
+#'
+#' @param stores An optional atomic vector with numbers specifying the stores IDs to filter data on. These are the business ids i.e. 2 is AAA store, 3 is BBB store etc.
+#'
+#' @param savePath An optional string that maps to the location you want the data to be stored
+#'
+#' @param excludeDates An optional atomic vector of strings in YYYY-MM-DD format that provides the dates that need to be excluded from the analysis
+#'
+#' @return A data table with the aggregated orders for the specified period and stores.
+#'
+#' @examples
+#'
+#' getOrderData(startDate = "2017-06-01", endDate = "2017-07-01", stores = c(3,4,5,6))
+#'
+#' getOrderData(startDate = "2017-06-01", endDate = "2017-07-01", stores = c(3,4,5,6), savePath = "C:/tmp/", excludeDates = c("2017-06-01", "2017-06-08"))
+#'
+#' @export
+
+getOrderData <- function(startDate, endDate, stores, savePath = NULL, excludeDates = NULL) {
+
+  # Ensure provided dates are valid
+  if ( is.na(lubridate::ymd(startDate, quiet = TRUE)) ){
+    error("The provided start date is not valid.")
+  }
+
+  if ( is.na(lubridate::ymd(endDate, quiet = TRUE)) ){
+    error("The provided start date is not valid.")
+  }
+
+  # Convert sting dates to date format
+  startDate <- as.Date(startDate)
+  endDate <- as.Date(endDate)
+
+  # Validate provided stores ids to match the in-package stores
+  if(is.null(stores) | !all(stores %in% OnlineStoreClusters$STORE_NUM)){
+    stop("Invalid / Unknown target store ids provided.")
+  }
+
+  # Generate SQL code to filter stores if required
+  if( is.null( stores ) ){
+    storeFilterQ <- ""
+  } else {
+    storeFilterQ <- paste0( "STORE_NUMBER IN (", paste0(stores, collapse = ",") , ") AND " )
+  }
+
+  # Generate the base name for saving the data
+  saveBaseName <- getBaseFileName(startDate, endDate, stores)
+
+  print(paste0("Extracting data from XXX from ", as.character(startDate), " to ",  as.character(endDate), "..."))
+
+  # Generate the XXX SQL Query (add +1 to end date to compensate for oracle not including between)
+  sqlQ <- paste0("
+                 SELECT
+                 STORE_NUM, DEL_DATE, DEL_DOW, DEL_SLOT_RND, SLOT_STATUS,
+                 MEDIAN(CASE RN WHEN 1 THEN SLOT_PRICE ELSE NULL END) AS SLOT_PRICE,
+                 COUNT(ORDER_NUMBER) AS ORDER_VOL,
+                 SUM(TOTALSHIPPING) AS DEL_REVENUE
+                 FROM (
+                 SELECT
+                 ORDER_NUMBER,
+                 ROUND(TO_NUMBER(STORE_NUMBER)) AS STORE_NUM,
+                 TO_CHAR(DELIVERY_DATE,'YYYY-MM-DD') AS DEL_DATE,
+                 TRIM(TO_CHAR(DELIVERY_DATE, 'Day')) AS DEL_DOW,
+                 TO_CHAR(DELIVERY_START_TIME, 'HH24') AS DEL_SLOT_RND,
+                 TOTALSHIPPING,
+                 CASE WHEN SLOT_STATUS IN('1','2') AND
+                 TOTALSHIPPING = 0  AND
+                 TOTALPRODUCT >= 100 AND
+                 TRIM(TO_CHAR(DELIVERY_DATE, 'Day')) IN ('Monday', 'Tuesday', 'Wednesday', 'Thursday') AND
+                 TO_NUMBER(TO_CHAR(DELIVERY_START_TIME, 'HH24')) >= 14 THEN 'FREE'
+                 WHEN SLOT_STATUS IN('1','2') THEN 'PAID'
+                 WHEN SLOT_STATUS IN('3','5') THEN 'DP'
+                 ELSE  'N/A' END AS SLOT_STATUS,
+                 CASE WHEN STANDARD_SLOT_PRICE = 0 OR SAMEDAY_ORDER = 1 THEN NULL ELSE STANDARD_SLOT_PRICE END AS SLOT_PRICE,
+                 ROW_NUMBER() OVER (PARTITION BY STORE_NUMBER,
+                 TO_CHAR(DELIVERY_DATE,'YYYY-MM-DD'),
+                 TO_CHAR(DELIVERY_START_TIME, 'HH24'),
+                 CASE WHEN SLOT_STATUS IN('1','2') AND
+                 TOTALSHIPPING = 0 AND
+                 TOTALPRODUCT >= 100 AND
+                 TRIM(TO_CHAR(DELIVERY_DATE, 'Day')) IN ('Monday', 'Tuesday', 'Wednesday', 'Thursday') AND
+                 TO_NUMBER(TO_CHAR(DELIVERY_START_TIME, 'HH24')) >= 14 THEN 'FREE'
+                 WHEN SLOT_STATUS IN('1','2') THEN 'PAID'
+                 WHEN SLOT_STATUS IN('3','5') THEN 'DP'
+                 ELSE 'N/A' END ORDER BY CREATE_DATE DESC) AS RN
+                 FROM
+                 XXXUSER_OWNER.Online_ORDER
+                 WHERE
+                 DELIVERY_DATE BETWEEN TO_DATE ('", as.character(startDate) ,"', 'YYYY-MM-DD') AND TO_DATE ('", as.character(endDate + 1) ,"', 'YYYY-MM-DD') AND "
+                 , storeFilterQ ,
+                 "ORDER_STATUS = 'C' AND
+                 LOCKED_FLAG = 1 AND
+                 ORDER_CANCELLED_DATE IS NULL AND
+                 ORDER_TYPE = 1 AND
+                 SLOT_STATUS > 0)
+                 GROUP BY
+                 STORE_NUM, DEL_DATE, DEL_DOW, DEL_SLOT_RND, SLOT_STATUS")
+
+
+  # Save the sql query in a file
+  if ( !is.null(savePath)  ){
+    saveData(sqlQ, savePath, paste0(saveBaseName,"_XXX_SQL_Query"), saveFormat = "sql")
+  }
+
+  # Run Query on on the XXX database and extract data
+  aggrOrders <- runQueryXXX(sqlQ)
+
+  # Stop execution if no data recieved
+  if (nrow(aggrOrders) == 0){
+    stop("The SQL query returned no data. Please check the query in the provided save path.")
+  }
+
+  # Save the raw data in a csv file
+  if ( !is.null(savePath)  ){
+    saveData(aggrOrders, savePath, paste0(saveBaseName,"_XXX_Data_Raw"), saveFormat = "csv")
+  }
+
+  print("Formatting received data...")
+
+  # Convert data to data table
+  aggrOrders <- data.table::setDT(aggrOrders)
+
+  # Format some variables into appropriate data types
+  aggrOrders[, DEL_DATE := lubridate::ymd(DEL_DATE)]
+  aggrOrders[, SLOT_STATUS := as.character(SLOT_STATUS)]
+  aggrOrders[, DEL_DOW := factor(DEL_DOW, levels = rev(c("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")))]
+
+  # Generate a dummy week id based on the delivery dates
+  aggrOrders[, WEEK_ID := (as.numeric(DEL_DATE - startDate) %/% 7) + 1]
+
+  # Convert values to doubles
+  aggrOrders[, ORDER_VOL := as.numeric(ORDER_VOL)]
+  aggrOrders[, DEL_REVENUE := as.numeric(DEL_REVENUE)]
+  aggrOrders[, SLOT_PRICE := as.numeric(SLOT_PRICE)]
+
+  # Fill up empty slot prices from same slot
+  aggrOrders <- aggrOrders[, list(CALC_SLOT_PRICE = isotone::weighted.median(SLOT_PRICE, ORDER_VOL)), by = c("STORE_NUM", "DEL_DATE", "DEL_DOW", "DEL_SLOT_RND")][aggrOrders, on = c("STORE_NUM", "DEL_DATE", "DEL_DOW", "DEL_SLOT_RND")]
+
+  aggrOrders[, SLOT_PRICE := CALC_SLOT_PRICE]
+  aggrOrders$CALC_SLOT_PRICE <- NULL
+
+  # If NAs in data (due to DP showing 0) then replace NA with the weighted median price of the slot for that store.
+  if(any(is.na(aggrOrders$SLOT_PRICE))){
+    aggrOrders[is.na(SLOT_PRICE),]$SLOT_PRICE <- merge(aggrOrders[is.na(SLOT_PRICE),], aggrOrders[!is.na(SLOT_PRICE),
+                                                                                                  list(SLOT_PRICE = isotone::weighted.median(SLOT_PRICE, ORDER_VOL)),
+                                                                                                  by = c("DEL_DOW", "DEL_SLOT_RND")], by = c("DEL_DOW", "DEL_SLOT_RND"), all.x = TRUE, sort = FALSE)$SLOT_PRICE.y
+  }
+
+  # Filter out dates to exlude from the analysis
+  if(!is.null(excludeDates)){
+    aggrOrders <- aggrOrders[!DEL_DATE %in% as.Date(excludeDates), ]
+    saveData(paste0(excludeDates, collapse = ","), savePath, paste0(saveBaseName,"_Excluded_Dates"), saveFormat = "txt")
+  }
+
+  # Save formatted data
+  if ( !is.null(savePath) ){
+    saveData(aggrOrders, savePath, paste0(saveBaseName,"_XXX_Data_Formatted"), saveFormat = "csv")
+    # saveData(aggrOrders, savePath, paste0(saveBaseName,"_Formatted"), saveFormat = "RData")
+  }
+
+  return(aggrOrders)
+
+}
+
+## Function 2
+#' Calculates the customer elasticity (i.e how well they respond to the price changes) across all slots based on historic data.
+#'
+#' A function to calculate the customer slot price elasticity metric.
+#'
+#' @param order_data A data table with the order data extracted from the XXX database
+#'
+#' @return A data table with the price elasticity metric for each delivery slot aggregated across all stores
+#'
+#' @examples
+#'
+#' calculateSlotElasticity(getAggrOrderData("2017-06-02"))
+#'
+#' @export
+
+calculateSlotElasticity <- function(order_data){
+
+  # Aggregate data if not already aggregated
+  if("ORDER_VOL" %in% colnames(order_data)){
+    aggrData <- copy(order_data)
+  } else {
+    aggrData <- order_data[, list( ORDER_VOL = .N ,
+                                   DEL_REVENUE = sum(TOTAL_SHIPPING, na.rm = TRUE),
+                                   SLOT_PRICE = median(SLOT_PRICE)), by = c("STORE_NUM","DEL_DATE", "DEL_DOW", "DEL_SLOT_RND", "SLOT_STATUS")]
+  }
+
+  # Calculate the ratio of orders, total slot volume
+  aggrData[, ORDER_RATIO := ORDER_VOL / sum(ORDER_VOL, na.rm = TRUE), by = c("STORE_NUM","WEEK_ID","DEL_DATE","DEL_DOW","DEL_SLOT_RND") ]
+  aggrData[, ORDER_VOL := sum(ORDER_VOL, na.rm = TRUE), by = c("STORE_NUM","WEEK_ID","DEL_DATE","DEL_DOW","DEL_SLOT_RND") ]
+  aggrData[, REVENUE := sum(DEL_REVENUE, na.rm = TRUE), by = c("STORE_NUM","WEEK_ID","DEL_DATE","DEL_DOW","DEL_SLOT_RND") ]
+
+  # Pivot data to get slot status as column
+  aggrData <- dcast(aggrData, WEEK_ID + STORE_NUM + DEL_DATE + DEL_DOW + DEL_SLOT_RND + SLOT_PRICE + ORDER_VOL + REVENUE ~ SLOT_STATUS, value.var = "ORDER_RATIO", fill = 0)
+
+  # Sort data in the appropriate way
+  setorder(aggrData, "WEEK_ID", "STORE_NUM", "DEL_DATE", "DEL_DOW", "DEL_SLOT_RND")
+
+  # remove the DP and FREE columns
+  aggrData[, DP := NULL]
+  aggrData[, FREE := NULL]
+
+  # Calculate the neighbour order vol, revenue and ratio of paid orders by adding the slot before and after
+  aggrData[, TOT_ORDER_VOL := ORDER_VOL + c(0, head(ORDER_VOL, -1)) + c(tail(ORDER_VOL, -1), 0), by = c("WEEK_ID", "STORE_NUM", "DEL_DATE", "DEL_DOW")]
+  aggrData[, TOT_REV := REVENUE + c(0, head(REVENUE, -1)) + c(tail(REVENUE, -1), 0), by = c("WEEK_ID", "STORE_NUM", "DEL_DATE", "DEL_DOW")]
+  aggrData[, TOT_PAID := colMeans(rbind(PAID ,c(NA, head(PAID, -1)), c(tail(PAID, -1), NA)), na.rm = TRUE), by = c("WEEK_ID", "STORE_NUM", "DEL_DATE", "DEL_DOW")]
+
+  # Copy the aggrData table and shift by a week
+  dat_prev <- copy(aggrData)
+  dat_prev[, WEEK_ID := WEEK_ID + 1]
+
+  # inner join with last week's data - i.e. Remove non-mathching rows (use .pw suffix for the previous week of data)
+  compareWeeklyData <- merge(aggrData[WEEK_ID > 1, ], dat_prev, by = c("WEEK_ID", "STORE_NUM", "DEL_DOW", "DEL_SLOT_RND"), suffixes = c("",".pw"))
+
+  # Calculate Price Change between the 2 weeks
+  compareWeeklyData[, PRICE_CHANGE := SLOT_PRICE - SLOT_PRICE.pw]
+
+  # calculate the volume and revenue difference while normalising for the week average - compensates for total week on week flactuations
+  compareWeeklyData[, TOT_ORDER_VOL_DIF := TOT_ORDER_VOL / mean(TOT_ORDER_VOL, na.rm = TRUE) - TOT_ORDER_VOL.pw / mean(TOT_ORDER_VOL.pw, na.rm = TRUE), by = c("WEEK_ID", "STORE_NUM")]
+  compareWeeklyData[, TOT_REV_DIF := TOT_REV / mean(TOT_REV, na.rm = TRUE) - TOT_REV.pw / mean(TOT_REV.pw, na.rm = TRUE), by = c("WEEK_ID", "STORE_NUM")]
+
+  # Keep only the slots that changed price
+  compareWeeklyData <- compareWeeklyData[PRICE_CHANGE != 0, ]
+
+  # Normalise volume and revenue ratios by the price change
+  compareWeeklyData[, VOL_RATIO := TOT_ORDER_VOL_DIF / PRICE_CHANGE]
+  compareWeeklyData[, REV_RATIO := TOT_REV_DIF / PRICE_CHANGE]
+
+  # Calculate the total ratio by averaging the normalised volume and revenue rations with a double weight on revenue
+  compareWeeklyData[, TOT_RATIO := (scale(TOT_ORDER_VOL_DIF) + 2 * scale(TOT_REV_DIF)) / 3]
+
+  # Aggregate elasticity across all stores
+  slotElasticity <- compareWeeklyData[, list(group_el = mean(TOT_RATIO, na.rm = TRUE)), by = c("DEL_DOW", "DEL_SLOT_RND", "SLOT_PRICE")]
+
+  # Normalise the elasticity metric to mean 1 and sd 0.1 (same as opportunity metric)
+  slotElasticity[, ELASTICITY := (group_el - mean(group_el, na.rm = TRUE)) / (10 * sd(group_el, na.rm = TRUE)) + 1]
+
+  # Return the appropriate columns
+  return(slotElasticity[, c("DEL_DOW", "DEL_SLOT_RND", "SLOT_PRICE", "ELASTICITY")])
+
+}
+
+## Function 3
+#' Calculate the slot's opportunity to increase delivery revenue based on historic data.
+#'
+#' A function to calculate the slot opportunity based on their historic order volume and revenue.
+#'
+#' @param order_data A data table with the order data from the raw XXX database
+#'
+#' @return A data table with the slot opportunity ranked for each store
+#'
+#' @examples
+#'
+#' calculateSlotOpportunity(getOrderDataAggregated("2017-06-02"))
+#'
+#' @export
+
+calculateSlotOpportunity <- function(order_data){
+
+  if("ORDER_VOL" %in% colnames(order_data)){
+    aggr_data <- copy(order_data)
+  } else {
+    aggr_data <- order_data[, list( ORDER_VOL = .N ,
+                                    DEL_REVENUE = sum(TOTAL_SHIPPING, na.rm = TRUE),
+                                    SLOT_PRICE = median(SLOT_PRICE, na.rm = TRUE)),
+                            by = c("WEEK_ID", "STORE_NUM","DEL_DATE", "DEL_DOW", "DEL_SLOT_RND", "SLOT_STATUS")]
+  }
+
+  # Calculate weekly total order volume and ratio [%] per slot and order type
+  aggr_data <- aggr_data[, list(ORDER_RATIO = ORDER_VOL/sum(ORDER_VOL, na.rm = TRUE),
+                                ORDER_VOL = sum(ORDER_VOL, na.rm = TRUE),
+                                REVENUE = sum(DEL_REVENUE, na.rm = TRUE),
+                                TYPE = SLOT_STATUS,
+                                SLOT_PRICE = SLOT_PRICE), by = c("WEEK_ID", "STORE_NUM", "DEL_DATE", "DEL_DOW", "DEL_SLOT_RND")]
+
+  # Pivot table to have order type as column
+  aggr_data <- data.table::dcast(aggr_data, WEEK_ID + STORE_NUM + DEL_DATE + DEL_DOW + DEL_SLOT_RND + ORDER_VOL + REVENUE + SLOT_PRICE ~ TYPE, value.var = "ORDER_RATIO", fill = 0)
+
+  # Caluclate Slot Revenue Opportunity - RANKING ALGORITHM ---------------------------------------------------------------------
+
+  # Extract only the relevant columns needed for the calculations
+  rank_dat <- aggr_data[, c("WEEK_ID", "STORE_NUM", "DEL_DATE", "DEL_DOW", "DEL_SLOT_RND", "ORDER_VOL", "REVENUE", "PAID", "SLOT_PRICE")]
+
+  # Order data
+  data.table::setorder(rank_dat, WEEK_ID, STORE_NUM, DEL_DATE, DEL_DOW, DEL_SLOT_RND)
+
+  # Copy the adjucent slot data to a new column and add NA if there is no adjucent slot
+  nm <- colnames(rank_dat)[6:ncol(rank_dat)]
+  nmR <- paste("R", nm, sep=".")
+  nmL <- paste("L", nm, sep=".")
+  rank_dat[, (nmL) := lapply(.SD, function(x) c(NA, x[-.N])), by = c("WEEK_ID", "STORE_NUM", "DEL_DATE", "DEL_DOW"), .SDcols = nm]
+  rank_dat[, (nmR) := lapply(.SD, function(x) c(x[-1], NA)), by = c("WEEK_ID", "STORE_NUM", "DEL_DATE", "DEL_DOW"), .SDcols = nm]
+
+  # Filter out the 7am and 10pm slots as not all stores offer them as delivery option
+  rank_dat <- rank_dat[DEL_SLOT_RND > 7 & DEL_SLOT_RND < 22 ,]
+
+  # Fill up the NA slot data with the data of the current slot (this smooths out edge cases)
+  rank_dat[is.na(rank_dat$L.ORDER_VOL) | is.na(rank_dat$L.REVENUE),
+           c("L.ORDER_VOL", "L.PAID", "L.SLOT_PRICE", "L.REVENUE")] <- rank_dat[is.na(rank_dat$L.ORDER_VOL) | is.na(rank_dat$L.REVENUE),
+                                                                                c("ORDER_VOL", "PAID", "SLOT_PRICE", "REVENUE")]
+  rank_dat[is.na(rank_dat$R.ORDER_VOL) | is.na(rank_dat$R.REVENUE),
+           c("R.ORDER_VOL", "R.PAID", "R.SLOT_PRICE", "R.REVENUE")] <- rank_dat[is.na(rank_dat$R.ORDER_VOL) | is.na(rank_dat$R.REVENUE),
+                                                                                c("ORDER_VOL", "PAID", "SLOT_PRICE", "REVENUE")]
+
+  # Calculated metrics for the revenue opportinity
+
+  # the Volume of the slot w.r.t the average volume in the grid.The higher this is the more popular the slot is, hence the more likely it is for people to pay an extra 1 pound
+  rank_dat[, "VolumeRatio" := ORDER_VOL / mean(ORDER_VOL, na.rm = TRUE), by = .I]
+
+  # volume of the slot w.r.t its neighbours The higher this is the more popular the slot is, hence the more likely it is for people to pay an extra 1 pound
+  rank_dat[, "VolumeRatioNeigh" := ORDER_VOL / (ORDER_VOL + R.ORDER_VOL + L.ORDER_VOL), by = .I]
+
+  # the relative increase in the price of the slot, if we increase it by 1 pound. Taking 1 to 2 pounds is essentally doubling the price than taking the 6 to 7 pounds
+  rank_dat[, "PriceRatio" := SLOT_PRICE / (SLOT_PRICE + 1), by = .I]
+
+  # Compare the price with the neighoubring prices so the price changes are smooth and not jumping more than 1 pound
+  rank_dat[, "PriceRatioNeigh" := L.SLOT_PRICE * R.SLOT_PRICE / ( (SLOT_PRICE + 1) ^ 2 ), by = .I]
+
+  # Include the % of paid deliveries in the slot
+  rank_dat[, "PaidDelRatio" := PAID, by = .I]
+
+  # Include the potential revenue from increasing the slot price by 1 pound assuming the volume is not affected
+  rank_dat[, "RevenueInc" := ORDER_VOL * PAID / mean(ORDER_VOL * PAID, na.rm = TRUE), by = .I]
+
+  # Include the potential revenue from increasing the slot price by 1 pound assuming the volume is not affected
+  rank_dat[, "RevenueIncV" := ORDER_VOL * PAID * (1 - 1 / (SLOT_PRICE + 1)) / mean(ORDER_VOL * PAID * (1 - 1 / (SLOT_PRICE + 1)), na.rm = TRUE), by = .I]
+
+  # Normalise the ratios to have equal weights
+  rank_dat[, c("VolumeRatio","VolumeRatioNeigh","PriceRatio","PriceRatioNeigh", "PaidDelRatio", "RevenueInc", "RevenueIncV")] <-
+    rank_dat[, lapply(.SD, function(x) 1 + (x - mean(x, na.rm = TRUE)) / ( 10 * sd(x, na.rm = TRUE))),
+             .SDcols = c("VolumeRatio", "VolumeRatioNeigh", "PriceRatio", "PriceRatioNeigh", "PaidDelRatio", "RevenueInc", "RevenueIncV")]
+
+  # Calculate opportunity by multiplying the various metrics
+  rank_dat[, "Opportunity" := VolumeRatio * VolumeRatioNeigh * PriceRatio * PriceRatioNeigh * PaidDelRatio * RevenueIncV, by = .I]
+
+  # Average weekly Opportunity per Store
+  rank_agg_week <- rank_dat[, list(Opportunity = weighted.mean(Opportunity, WEEK_ID, na.rm = TRUE)), by=c("STORE_NUM" ,"DEL_DOW", "DEL_SLOT_RND", "SLOT_PRICE")]
+
+  # Rank the slots based on opportunity
+  rank_agg_week[, "Rank" := rank(-Opportunity), by = "STORE_NUM"]
+
+  return(rank_agg_week)
+}
+
+sumGroupOpportunity <- function(opp_data){
+
+  # Summarise opportunity and rank scores
+  return(opp_data[, list(Rank = mean(Rank, na.rm = TRUE), Opportunity = mean(Opportunity, na.rm = TRUE)),  by=c("DEL_DOW", "DEL_SLOT_RND", "SLOT_PRICE")])
+
+}
+
+
+## Function 4
+#' Calculate the total slot score by combining the opportunity and the elasticity metrics
+#'
+#' A function to combine the slot opportunity and the elasticity metric in order to create more dynamic recommendations
+#'
+#' @param order_data A data table with the order data from the raw XXX database
+#'
+#' @return A data table with the score metric for each slot - price combination observed in the past
+#'
+#' @examples
+#'
+#' calculateSlotOpportunity( getOrderDataAggregated("2017-06-02") )
+#'
+#' @export
+
+calculateSlotOverallScore <- function(order_data){
+  # Calculate the slot opportunity scores
+  slotRankings <- sumGroupOpportunity( calculateSlotOpportunity(order_data) )
+
+  # calculate the slot elasticity metric
+  slotElasticity <- calculateSlotElasticity(order_data)
+
+  # Left join slot rankings with elasticity scores
+  overallScores <- slotElasticity[slotRankings, on = c("DEL_DOW", "DEL_SLOT_RND", "SLOT_PRICE")]
+
+  # Set unknown elasticities to 1
+  overallScores[is.na(ELASTICITY), ]$ELASTICITY <- 1
+
+  # Multiply elasticity and opportunity
+  overallScores[, SCORE := ELASTICITY * Opportunity]
+
+  return(overallScores)
+}
+
+## Function 5
+#' Generate recommended price changes from the provided slot scores
+#'
+#' The function uses the slot score and the current price grid to generate the price recommendations
+#'
+#' @param current_grid A data table with the current slot prices extracted from data using getGridPrices function
+#'
+#' @param opportunity_scores the calculated opportunity scores from the order data
+#'
+#' @param changesN Optional: an atomiv vector with the number of changes to propose (Up, Down) (default is 10 up, 5 down). By changing these numbers you make the algorithm more agressive or balanced.
+#'
+#' @param priceRange Optional: an atomic vector with the slot minimum and maximum price allowed (default is from 1 to 7 pounds)
+#'
+#' @param priceStep Optional: the price step for the recommended changes (default is 0.50p)
+#'
+#' @return A data table with the recommended price changes
+#'
+#' @examples
+#'
+#' aggrDat <- getOrderDataAggregated("2017-06-01")
+#' recommendPriceChangesFromScores(getLatestGridPrices(aggrDat) , sumGroupOpportunity(rankSlotOpportunity(aggrDat)))
+#'
+#' @export
+
+recommendPriceChangesFromScores <- function(current_grid, opportunity_scores, changesN = c(10, 5), priceRange = c(1, 7), priceStep = 0.5){
+
+  # Check if Score does not exist and copy the opportunity metric
+  if(!"SCORE" %in% colnames(opportunity_scores)){
+    opportunity_scores[, SCORE := Opportunity]
+  }
+
+  # Merge scores with current grid
+  cur_Recommendations <- data.table::setorder(opportunity_scores[current_grid[DEL_SLOT_RND > 7 & DEL_SLOT_RND < 22], on = c("DEL_DOW", "DEL_SLOT_RND", "SLOT_PRICE")], -SCORE)
+
+  # Get best X recommendations which are not proposing to increase beyond maxPrice or decrease below minPrice
+  cur_Recommendations <- rbind(head(cur_Recommendations, changesN[1])[, NEW_SLOT_PRICE := priceStep],
+                               tail(cur_Recommendations, changesN[2])[, NEW_SLOT_PRICE := -priceStep])[, NEW_SLOT_PRICE := SLOT_PRICE + NEW_SLOT_PRICE]
+
+  # Keep recommendations in price range
+  cur_Recommendations <- cur_Recommendations[NEW_SLOT_PRICE >= priceRange[1] & NEW_SLOT_PRICE <= priceRange[2],]
+
+  # Filter out unessesary columns
+  cur_Recommendations <- cur_Recommendations[, c("DEL_DOW", "DEL_SLOT_RND", "SLOT_PRICE", "NEW_SLOT_PRICE")]
+
+  # Copy the 8am and 21 pm changes to 7am and 22pm respectively to smooth grid
+  edgeCases <- copy(cur_Recommendations[DEL_SLOT_RND %in% c(8,21), ])[,DEL_SLOT_RND := ifelse(DEL_SLOT_RND == 8, 7, ifelse(DEL_SLOT_RND == 21,22,DEL_SLOT_RND))]
+  cur_Recommendations <- rbind(cur_Recommendations, edgeCases)
+
+  return(cur_Recommendations)
+}
+
+# Function 6
+#' Format Recommended Price Changes
+#'
+#' A function formats the recommended prices changes from the algorithm (adds pound sign, transpose data etc.) to match the business requirements.
+#'
+#' @param recommendedChanges The data table with the recommended price changes generated with the recommendPriceChangesFromScores function.
+#'
+#' @return The formatted price grid
+#'
+#' @export
+
+formatRecommendedPriceChanges <- function(recommendedChanges){
+
+  # Format recommended changes for output, add column names, pound sign and :00 to slot time
+  colnames(recommendedChanges) <- c("DEL DOW", "DEL SLOT", "OLD PRICE", "NEW PRICE")
+  setorder(recommendedChanges, -"DEL DOW", "DEL SLOT")
+  recommendedChanges[, `DEL SLOT` := paste0(`DEL SLOT`,":00")]
+  recommendedChanges[, `OLD PRICE` := sprintf("\u00a3%.2f", as.numeric(`OLD PRICE`))]
+  recommendedChanges[, `NEW PRICE` := sprintf("\u00a3%.2f", as.numeric(`NEW PRICE`))]
+
+  return(recommendedChanges)
+}
+
+# Function 7
+#' Format Recommended Price Grid
+#'
+#' A function formats the grid recommended my the algorithm (adds pound sign, transpose data etc.) to match the business requirements.
+#'
+#' @param recommendedGrid The data table with the modifed price grid generated with the generateProposedGrid function.
+#'
+#' @return The formatted price grid
+#'
+#' @export
+
+formatRecommendedPriceGrid <- function(recommendedGrid){
+
+  # Format proposed grid for output by adding column names and :00 to hour slots
+  colnamesR <- as.character(recommendedGrid$DEL_DOW)
+  rownamesR <- paste0(colnames(recommendedGrid)[-1],":00")
+  recommendedGrid <- data.table(t(recommendedGrid)[2:ncol(recommendedGrid),])
+
+  # Fill edge cases i.e. 7am or 10pm with the nearest value
+  recommendedGrid <- recommendedGrid[, lapply(.SD, function(x){
+    emptyCells <- which(is.na(x))
+    x[emptyCells] <- unlist(lapply(emptyCells, function(y){mean(c(as.numeric(x[y-1]), as.numeric(x[y+1])), na.rm = TRUE)}))
+    return(x)
+  }), .SDcols = colnames(recommendedGrid)]
+
+  recommendedGrid <- data.table(rownamesR, recommendedGrid)
+  colnames(recommendedGrid) <- c("DEL SLOT", colnamesR)
+  recommendedGrid <- cbind(recommendedGrid[, 1],
+                           recommendedGrid[, lapply(.SD, function(x){sprintf("\u00a3%.2f", as.numeric(x))}), .SDcols = colnames(recommendedGrid)[-1]])
+
+  return(recommendedGrid)
+}
+
+# Function 8
+#' Extract the latest price grid from the data.
+#'
+#' @param order_data A data table with the data from the XXX database.
+#'
+#' @return A data table with the latest slot prices
+#'
+#' @examples
+#'
+#' getLatestGridPrices(getOrderDataAggregated("2017-06-02"))
+#'
+#' @export
+
+getLatestGridPrices <- function(Order_data){
+
+  # Get sales for the most recent days and extract the median price people paid for each slot
+  weekly_grids <- Order_data[DEL_DATE > ( max(Order_data$DEL_DATE, na.rm = TRUE) - 7) & SLOT_STATUS =="PAID", list(SLOT_PRICE = isotone::weighted.median(SLOT_PRICE, ORDER_VOL)), by =c("DEL_DATE","DEL_DOW","DEL_SLOT_RND")]
+
+  weekly_grids <- weekly_grids[,c("DEL_DOW", "DEL_SLOT_RND", "SLOT_PRICE")]
+
+  return(weekly_grids)
+}
+
+
+# Function 9
+#' Generate the recommended price grid using the already generated price change recommendations
+#'
+#' The function applies the recommended changes on the current price grid to generate the new price grid.
+#'
+#' @param current_grid A data table with the current slot prices extracted from data using getGridPrices function
+#'
+#' @param recommendedChanges The data table with the price recommendations generated using getRecommendedChangesFromRankings function
+#'
+#' @return A data table with the new recommended price grid
+#'
+#' @examples
+#'
+#' aggrDat <- getAggrOrderData(as.Date("2017-07-09"))
+#' generateProposedGrid(getLatestGridPrices(aggrDat) , getPriceRecommendationsSimple(aggrDat))
+#'
+#' @export
+
+generateProposedGrid <- function(current_grid, recommendedChanges){
+
+  # Push recommended changes back on the current grid
+  proposed_grid <- recommendedChanges[, c("DEL_DOW", "DEL_SLOT_RND", "NEW_SLOT_PRICE")][current_grid, on = c("DEL_DOW", "DEL_SLOT_RND")]
+
+  # Calculate the new price
+  proposed_grid[, NEW_SLOT_PRICE := ifelse(is.na(NEW_SLOT_PRICE), SLOT_PRICE, NEW_SLOT_PRICE)]
+
+  # convert DOW as a factor
+  proposed_grid[, DEL_DOW := factor(DEL_DOW, levels = c("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"))]
+
+  # pivot data to look like the standard grid
+  proposed_grid <- data.table::dcast(proposed_grid, DEL_DOW ~ DEL_SLOT_RND, value.var = "NEW_SLOT_PRICE")
+
+  return(proposed_grid)
+}
+
+
+# Function 10
+#' Generate the recommended price grid using the already generated price change recommendations
+#'
+#' The function applies the recommended changes on the current price grid to generate the new price grid.
+#'
+#' @param current_grid A data table with the current slot prices extracted from data using getGridPrices function
+#'
+#' @param recommendedChanges The data table with the price recommendations generated using getRecommendedChangesFromRankings function
+#'
+#' @return A data table with the new recommended price grid
+#'
+#' @examples
+#'
+#' aggrDat <- getAggrOrderData(as.Date("2017-07-09"))
+#' generateProposedGrid(getLatestGridPrices(aggrDat) , getPriceRecommendationsSimple(aggrDat))
+#'
+#' @export
+
+generateProposedGrid <- function(current_grid, recommendedChanges){
+
+  # Push recommended changes back on the current grid
+  proposed_grid <- recommendedChanges[, c("DEL_DOW", "DEL_SLOT_RND", "NEW_SLOT_PRICE")][current_grid, on = c("DEL_DOW", "DEL_SLOT_RND")]
+
+  # Calculate the new price
+  proposed_grid[, NEW_SLOT_PRICE := ifelse(is.na(NEW_SLOT_PRICE), SLOT_PRICE, NEW_SLOT_PRICE)]
+
+  # convert DOW as a factor
+  proposed_grid[, DEL_DOW := factor(DEL_DOW, levels = c("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"))]
+
+  # pivot data to look like the standard grid
+  proposed_grid <- data.table::dcast(proposed_grid, DEL_DOW ~ DEL_SLOT_RND, value.var = "NEW_SLOT_PRICE")
+
+  return(proposed_grid)
+}
+
