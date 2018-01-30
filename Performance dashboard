@@ -1,5 +1,5 @@
 ---
-title: "Weekly Price Comparison"
+title: "Benchmark Performance Against Control Stores"
 output: 
   flexdashboard::flex_dashboard:
     orientation: columns
@@ -16,12 +16,14 @@ library(data.table)
 library(ggplot2)
 library(DT)
 library(plotly)
+
+# Add store labels in data
+order_data$STORE_TYPE <- "Control"
+order_data[STORE_NUM %in% test_stores,]$STORE_TYPE <- "Test"
 ```
 
 Overview
 =====================================
-
-
 
 Column {data-width=600}
 -------------------------------------
@@ -33,35 +35,78 @@ cat(paste0("Data extracted between ", min(order_data$DEL_DATE, na.rm = TRUE), " 
 
 ```
 
-### Weekly Orders Summary
-```{r, fig.width=9, fig.height=5}
+### Weekly Summary
+```{r, fig.width=12, fig.height=5}
 
-weekly_summary <- order_data[, list(DEL_DATE = min(DEL_DATE, na.rm = TRUE), VOL = sum(ORDER_VOL)), by = c("WEEK_ID","SLOT_STATUS")][
-  , DEL_DATE := min(DEL_DATE, na.rm = TRUE), by = "WEEK_ID"]
+weekly_summary <- order_data[, list(DEL_DATE = min(DEL_DATE, na.rm = TRUE), VOL = sum(ORDER_VOL), REV = sum(DEL_REVENUE)), 
+                            by = c("WEEK_ID","SLOT_STATUS","STORE_TYPE","STORE_NUM")]
+weekly_summary <- weekly_summary[, list(DEL_DATE = min(DEL_DATE, na.rm = TRUE), VOL = sum(VOL), REV = sum(REV), STORES = .N), 
+                                 by = c("WEEK_ID","SLOT_STATUS","STORE_TYPE")]
+weekly_summary <- weekly_summary[, VOLUME := VOL/STORES]
+weekly_summary <- weekly_summary[, REVENUE := REV/STORES]
+weekly_summary <- weekly_summary[, DEL_DATE := min(DEL_DATE, na.rm = TRUE), by = c("WEEK_ID","STORE_TYPE")]
 
-ggplot(weekly_summary, aes(x = DEL_DATE, y = VOL, color = SLOT_STATUS)) + 
-  geom_line() + 
-  geom_point() +
-  theme_bw(base_size = 18) + 
-  labs(x = "Week Start Date", y = "# of Transactions", color = "Delivery Type") +
-  scale_x_date(breaks = as.Date(unique(weekly_summary$DEL_DATE))) +
-  ylim(c(0, max(weekly_summary$VOL, na.rm = TRUE)))
+weekly_summary <- melt(weekly_summary, id.vars = c("WEEK_ID", "SLOT_STATUS", "STORE_TYPE", "DEL_DATE", "STORES"), variable.name = "VAR", value.name = "VAL")
+
+## if same number of stores 
+if(unique(weekly_summary[STORE_TYPE == "Test",STORES]) == unique(weekly_summary[STORE_TYPE == "Control",STORES])) {
+  weekly_summary <- weekly_summary[VAR %in% c("VOL", "REV")]
+  weekly_summary <- weekly_summary[, VAR := factor(VAR, levels = c("VOL", "REV"), labels = c("Volume", "Revenue"))]
+  ggplot(weekly_summary, aes(x = DEL_DATE, y = VAL, color = SLOT_STATUS, linetype = STORE_TYPE)) + 
+    facet_wrap(~VAR, ncol = 2, scales = "free") + 
+    geom_line() + geom_point() +
+    theme_bw(base_size = 18) + 
+    labs(x = "Week Start Date", y = "Weekly Volume & Revenue", color = "Delivery Type", linetype = "Analysis Group") +
+    scale_x_date(breaks = as.Date(unique(weekly_summary$DEL_DATE))) + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+} else {
+  weekly_summary <- weekly_summary[VAR %in% c("VOLUME", "REVENUE")]
+  ggplot(weekly_summary, aes(x = DEL_DATE, y = VAL, color = SLOT_STATUS, linetype = STORE_TYPE)) + 
+    facet_wrap(~VAR, ncol = 2, scales = "free") + 
+    geom_line() +  geom_point() +
+    theme_bw(base_size = 18) + 
+    labs(x = "Week Start Date", y = "Average Weekly Volume & Revenue", color = "Delivery Type", linetype = "Analysis Group") +
+    scale_x_date(breaks = as.Date(unique(weekly_summary$DEL_DATE))) + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
 ```
 
-### Latest Price Grid
+### Current Price Grid
 ```{r, fig.width=9, fig.height=5}
 
-graphData <- merge(expand.grid(DEL_DOW = c("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"), DEL_SLOT_RND = 7:22), 
-                   getLatestGridPrices(order_data[WEEK_ID == max(WEEK_ID,na.rm = TRUE)]), by = c("DEL_DOW", "DEL_SLOT_RND"), all.x = TRUE)
-                   
-ggplot(graphData, aes(x = DEL_DOW, y = DEL_SLOT_RND)) + 
+graphDataTest <- setDT(merge(expand.grid(DEL_DOW = c("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"), DEL_SLOT_RND = 7:22), 
+                   getLatestGridPrices(order_data[WEEK_ID == max(WEEK_ID,na.rm = TRUE) & STORE_TYPE == "Test"]), 
+                   by = c("DEL_DOW", "DEL_SLOT_RND"), all.x = TRUE))
+graphDataTest[, DEL_DOW := factor(substr(DEL_DOW,1,3), levels = c("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"))]
+
+graphDataControl<- setDT(merge(expand.grid(DEL_DOW = c("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"), DEL_SLOT_RND = 7:22), 
+                   getLatestGridPrices(order_data[WEEK_ID == max(WEEK_ID,na.rm = TRUE) & STORE_TYPE == "Control"]), 
+                   by = c("DEL_DOW", "DEL_SLOT_RND"), all.x = TRUE))
+graphDataControl[, DEL_DOW := factor(substr(DEL_DOW,1,3), levels = c("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"))]
+
+plotA <- ggplot(graphDataTest, aes(x = DEL_DOW, y = DEL_SLOT_RND)) + 
   geom_tile(aes(fill = SLOT_PRICE), color = "black", show.legend = FALSE, na.rm = TRUE) + 
-  geom_text(data = setDT(graphData)[!is.na(SLOT_PRICE),], aes(label = paste0("£", ifelse(SLOT_PRICE %% 1 == 0, SLOT_PRICE, sprintf("%.2f", SLOT_PRICE))))) +
+  geom_text(data = setDT(graphDataTest)[!is.na(SLOT_PRICE),], aes(label = paste0("£", ifelse(SLOT_PRICE %% 1 == 0, SLOT_PRICE, sprintf("%.2f", SLOT_PRICE))))) +
   scale_y_reverse(lim=c(22.5, 6.5), breaks = 7:22) + 
   scale_fill_gradient(low = "green", high = "red") + 
   theme_bw(base_size = 18) +
   labs(x = "", y = "Hour Slots") + 
-  scale_x_discrete(position = "top")
+  scale_x_discrete(position = "top")+
+  ggtitle("Test") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+plotB <- ggplot(graphDataControl, aes(x = DEL_DOW, y = DEL_SLOT_RND)) + 
+  geom_tile(aes(fill = SLOT_PRICE), color = "black", show.legend = FALSE, na.rm = TRUE) + 
+  geom_text(data = setDT(graphDataControl)[!is.na(SLOT_PRICE),], aes(label = paste0("£", ifelse(SLOT_PRICE %% 1 == 0, SLOT_PRICE, sprintf("%.2f", SLOT_PRICE))))) +
+  scale_y_reverse(lim=c(22.5, 6.5), breaks = 7:22) + 
+  scale_fill_gradient(low = "green", high = "red") + 
+  theme_bw(base_size = 18) +
+  labs(x = "", y = "") + 
+  scale_x_discrete(position = "top") +
+  ggtitle("Control") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+gridExtra::grid.arrange(plotA,plotB, ncol = 2)
 
 
 ```
@@ -72,7 +117,11 @@ Column {data-width=400}
 
 ### Store List
 ```{r}
-DT::datatable(OnlineStoreClusters[STORE_NUM %in% unique(order_data$STORE_NUM), c("CLUSTER_ID", "STORE_NUM", "STORE_NAME")], rownames = FALSE, options = list(pageLength = 50, columnDefs = list(list(className = 'dt-center', targets = 0:2))), width = "400px")
+stores <- jsGOLStoreClusters[STORE_NUM %in% unique(order_data$STORE_NUM), c("CLUSTER_ID", "STORE_NUM", "STORE_NAME")]
+stores$TYPE <- "Control"
+stores[STORE_NUM %in% test_stores,]$TYPE <- "Test"
+
+DT::datatable(stores, rownames = FALSE, options = list(pageLength = 50, columnDefs = list(list(className = 'dt-center', targets = 0:3))), width = "400px")
 ```
 
 Latest Order Grid
@@ -81,49 +130,36 @@ Latest Order Grid
 ```{r}
 
 # Get and aggregate the latest week's data
-current_data <- order_data[WEEK_ID == max(order_data$WEEK_ID, na.rm = TRUE)][
-  , list(ORDER_VOL = sum(ORDER_VOL, na.rm = TRUE), 
-         REVENUE = sum(DEL_REVENUE, na.rm = TRUE)), 
-  by = c("DEL_DOW", "DEL_SLOT_RND", "SLOT_STATUS", "SLOT_PRICE")]
+current_data <- order_data[WEEK_ID == max(order_data$WEEK_ID, na.rm = TRUE)][, list(ORDER_VOL = sum(ORDER_VOL, na.rm = TRUE), SLOT_PRICE = median(SLOT_PRICE, na.rm = TRUE)), by = c("DEL_DOW", "DEL_SLOT_RND", "SLOT_STATUS", "STORE_TYPE", "STORE_NUM")][, list(ORDER_VOL = sum(ORDER_VOL, na.rm = TRUE), SLOT_PRICE = median(SLOT_PRICE, na.rm = TRUE), STORES = .N), by = c("DEL_DOW", "DEL_SLOT_RND", "SLOT_STATUS", "STORE_TYPE")][, STORES := max(STORES), by = "STORE_TYPE"]
 
 # Get and aggregate the previous week's data
-prev_data <- order_data[WEEK_ID == max(order_data$WEEK_ID, na.rm = TRUE)-1][
-  , list(ORDER_VOL = sum(ORDER_VOL, na.rm = TRUE), REVENUE = sum(DEL_REVENUE, na.rm = TRUE)), 
-  by = c("DEL_DOW", "DEL_SLOT_RND", "SLOT_STATUS", "SLOT_PRICE")]
+prev_data <- order_data[WEEK_ID == max(order_data$WEEK_ID, na.rm = TRUE)-1][, list(ORDER_VOL = sum(ORDER_VOL, na.rm = TRUE), SLOT_PRICE = median(SLOT_PRICE, na.rm = TRUE)), by = c("DEL_DOW", "DEL_SLOT_RND", "SLOT_STATUS", "STORE_TYPE", "STORE_NUM")][, list(ORDER_VOL = sum(ORDER_VOL, na.rm = TRUE), SLOT_PRICE = median(SLOT_PRICE, na.rm = TRUE), STORES = .N), by = c("DEL_DOW", "DEL_SLOT_RND", "SLOT_STATUS", "STORE_TYPE")][, STORES := max(STORES), by = "STORE_TYPE"]
 
 # Identify price changes in the latest grid
-data <- merge(current_data, prev_data, by = c("DEL_DOW", "DEL_SLOT_RND", "SLOT_STATUS"), all.x = TRUE, suffixes = c("", ".p"))[
+data <- merge(current_data, prev_data, by = c("DEL_DOW", "DEL_SLOT_RND", "SLOT_STATUS", "STORE_TYPE"), all.x = TRUE, suffixes = c("", ".p"))[
   , P_CHANGE := 0][SLOT_PRICE > SLOT_PRICE.p, P_CHANGE := 1][SLOT_PRICE < SLOT_PRICE.p, P_CHANGE := -1]
 
-data[, REVENUE := sum(REVENUE, na.rm = TRUE), by = c("DEL_DOW", "DEL_SLOT_RND")]
 # Format the data, by pivoting slot status, normalising volume and calculating revenue
-data <- dcast(data, DEL_DOW + DEL_SLOT_RND + SLOT_PRICE + REVENUE + P_CHANGE ~ SLOT_STATUS, value.var = "ORDER_VOL", fun.aggregate = sum)
+data <- dcast(data, DEL_DOW + DEL_SLOT_RND + SLOT_PRICE + STORE_TYPE + STORES + P_CHANGE ~ SLOT_STATUS, value.var = "ORDER_VOL", fun.aggregate = sum)
 data[, TOT_VOL := DP + FREE + PAID]
 data[, DP := DP / TOT_VOL]
 data[, FREE := FREE / TOT_VOL]
 data[, PAID := PAID / TOT_VOL]
-# data[, REVENUE := TOT_VOL * PAID * SLOT_PRICE]
-
-# Aggregate differences between stores
-data <- data[, list(SLOT_PRICE = paste0(as.vector(na.omit(unique(paste0("£", ifelse(SLOT_PRICE %% 1 == 0, SLOT_PRICE, sprintf("%.2f", SLOT_PRICE)))))), collapse = " / "),
-            P_CHANGE = median(P_CHANGE, na.rm = TRUE),
-            DP = mean(DP, na.rm = TRUE),
-            FREE = mean(FREE, na.rm = TRUE),
-            PAID = mean(PAID, na.rm = TRUE),
-            TOT_VOL = sum(TOT_VOL, na.rm = TRUE),
-            REVENUE = sum(REVENUE, na.rm = TRUE)), 
-     by = c("DEL_DOW", "DEL_SLOT_RND")]
+data[, REVENUE := TOT_VOL * PAID * SLOT_PRICE]
+data[, NORM_VOL := TOT_VOL / STORES]
+data[, NORM_REV := round(REVENUE / STORES)]
 
 # Generate the tile plot for the latest week
 ggplot(data, aes(y = DEL_DOW, x = DEL_SLOT_RND)) +
-  geom_tile(aes(fill = TOT_VOL), color = "black", size = 1) +
-  geom_text(aes(label = SLOT_PRICE), size = 5,
+  facet_grid( ~ STORE_TYPE) +
+  geom_tile(aes(fill = NORM_VOL), color = "black", size = 1) +
+  geom_text(aes(label = paste0("£", ifelse(SLOT_PRICE %% 1 == 0, SLOT_PRICE, sprintf("%.2f", SLOT_PRICE)))), size = 5,
             color = "black", nudge_y = 0.15, nudge_x = 0, fontface = "bold", show.legend = FALSE, na.rm = TRUE) + 
   geom_point(aes(y = as.numeric(DEL_DOW) - 0.33, size = P_CHANGE > 0), 
-             shape = 24, fill = "darkblue", show.legend = FALSE, na.rm = TRUE) +
+             shape = 24, fill = "red", show.legend = FALSE, na.rm = TRUE) +
   geom_point(aes(y = as.numeric(DEL_DOW) - 0.33, size = P_CHANGE < 0), 
-             shape = 25, fill = "red", show.legend = FALSE, na.rm = TRUE) +
-  geom_text(aes(label = paste0("£", REVENUE)), size = 4, 
+             shape = 25, fill = "darkblue", show.legend = FALSE, na.rm = TRUE) +
+  geom_text(aes(label = paste0("£", NORM_REV)), size = 4, 
             colour = "black", nudge_y = -0.12, show.legend = FALSE, na.rm = TRUE) +
   geom_rect(aes(xmin = DEL_SLOT_RND - 0.49, xmax = DEL_SLOT_RND - 0.49 + DP * 0.98, ymin = as.numeric(DEL_DOW) + 0.4, 
                 ymax = as.numeric(DEL_DOW) + 0.49, color = "Del. Pass"), linetype = 0, fill = "blue", alpha = 1, na.rm = TRUE) +
@@ -131,7 +167,7 @@ ggplot(data, aes(y = DEL_DOW, x = DEL_SLOT_RND)) +
                 ymax = as.numeric(DEL_DOW) + 0.49, color = "Paid"), linetype = 0, fill = "magenta", alpha = 1, na.rm = TRUE) +
   geom_rect(aes(xmin = DEL_SLOT_RND - 0.49 + (DP + PAID) * 0.98, xmax = DEL_SLOT_RND - 0.49 + (DP + PAID + FREE) * 0.98, ymin = as.numeric(DEL_DOW) + 0.4, 
                 ymax = as.numeric(DEL_DOW) + 0.49, color = "Free"), linetype = 0, fill = "yellow", alpha = 1, na.rm = TRUE) +
-  scale_fill_gradient(low = "green", high = "red", limits = c(0, max(data$TOT_VOL))) +
+  scale_fill_gradient(low = "green", high = "red", limits = c(0, max(data$NORM_VOL))) +
   scale_colour_manual(values = c("Del. Pass" = "blue", "Paid" = "magenta", "Free" = "yellow")) +
   guides(color = guide_legend(override.aes = list(size = 3, linetype = 1, fill = NA))) +
   theme_bw(base_size = 18) +
@@ -139,7 +175,89 @@ ggplot(data, aes(y = DEL_DOW, x = DEL_SLOT_RND)) +
   scale_y_discrete(limits = levels(data$DEL_DOW)) +
   scale_x_continuous(limits = c(6.5, 22.5), breaks = 7:22) +
   theme(panel.spacing = unit(0, "lines"), panel.grid.minor = element_blank()) +
-  labs(x = "Hour Slot", y = "", fill = "Order Volume", color = "Order Ratio")
+  labs(x = "Hour Slot", y = "", fill = "Order Volume", color = "Order Ratio") +
+  theme(legend.position="bottom")
+
+```
+
+Slot Comparison
+=====================================
+
+```{r}
+dd <- setDT(data)
+dd <-  dcast(dd,  DEL_DOW + DEL_SLOT_RND  ~ STORE_TYPE, value.var = c("SLOT_PRICE", "TOT_VOL", "REVENUE", "NORM_VOL", "NORM_REV"))
+dd[, PRICE_CH := factor(SLOT_PRICE_Test - SLOT_PRICE_Control)]
+
+subplot(
+  plot_ly(data = dd) %>%
+    add_trace(x = ~TOT_VOL_Control, y = ~TOT_VOL_Test, color = ~PRICE_CH,
+              text = ~paste0(DEL_DOW, " ", DEL_SLOT_RND, ":00 </br>£", SLOT_PRICE_Control," to ", SLOT_PRICE_Test),
+              mode = "markers", type = "scatter", name = "Order Volume", showlegend = FALSE) %>%
+    add_trace(x = c(0, ~max(c(TOT_VOL_Control, TOT_VOL_Test), na.rm = TRUE)), 
+              y = c(0, ~max(c(TOT_VOL_Control, TOT_VOL_Test), na.rm = TRUE)), 
+              line = list(dash = 'dash'), mode = "lines", type = "scatter", showlegend = FALSE),
+  
+  plot_ly(data = dd) %>%
+    add_trace(x = ~ REVENUE_Control, y = ~ REVENUE_Test, color = ~PRICE_CH,
+              text = ~paste0(DEL_DOW, " ", DEL_SLOT_RND, ":00 </br>£", SLOT_PRICE_Control," to ", SLOT_PRICE_Test),
+              mode = "markers", type = "scatter", name = "Delivery Revenue", showlegend = FALSE) %>%
+    add_trace(x = c(0, ~max(c(REVENUE_Control, REVENUE_Test), na.rm = TRUE)), 
+              y = c(0, ~max(c(REVENUE_Control, REVENUE_Test), na.rm = TRUE)), 
+              line = list(dash = 'dash'), mode = "lines", type = "scatter", showlegend = FALSE), 
+  
+  plot_ly(data = dd) %>%
+    add_trace(x = ~NORM_VOL_Control, y = ~NORM_VOL_Test, color = ~PRICE_CH,
+              text = ~paste0(DEL_DOW, " ", DEL_SLOT_RND, ":00 </br>£", SLOT_PRICE_Control," to ", SLOT_PRICE_Test),
+              mode = "markers", type = "scatter", name = "Normalised Volume", showlegend = FALSE) %>%
+    add_trace(x = c(0, ~max(c(NORM_VOL_Control, NORM_VOL_Test), na.rm = TRUE)), 
+              y = c(0, ~max(c(NORM_VOL_Control, NORM_VOL_Test), na.rm = TRUE)), 
+              line = list(dash = 'dash'), mode = "lines", type = "scatter", showlegend = FALSE),
+  
+  plot_ly(data = dd) %>%
+    add_trace(x = ~NORM_REV_Control, y = ~NORM_REV_Test, color = ~PRICE_CH,
+              text = ~paste0(DEL_DOW, " ", DEL_SLOT_RND, ":00 </br>£", SLOT_PRICE_Control," to ", SLOT_PRICE_Test),
+              mode = "markers", type = "scatter", name = "Normalised Del. Revenue", showlegend = FALSE) %>%
+    add_trace(x = c(0, ~max(c(NORM_REV_Test, NORM_REV_Control), na.rm = TRUE)), 
+              y = c(0, ~max(c(NORM_REV_Test, NORM_REV_Control), na.rm = TRUE)),
+              line = list(dash = 'dash'), mode = "lines", type = "scatter", showlegend = FALSE),
+  margin = 0.05, nrows = 2) %>%
+  layout(title = paste0("Performance Comparison for Test (", max(data[STORE_TYPE=="Test"]$STORES), " stores) vs Control (", max(data[STORE_TYPE=="Control"]$STORES), " stores)"),
+         yaxis = list(title = "Test Stores", scaleanchor = "x", showline = TRUE, mirror = 'ticks'),
+         yaxis2 = list(title = "Test Stores", scaleanchor = "x2", showline = TRUE, mirror = 'ticks'),
+         yaxis3 = list(title = "Test Stores", scaleanchor = "x3", showline = TRUE, mirror = 'ticks'),
+         yaxis4 = list(title = "Test Stores", scaleanchor = "x4", showline = TRUE, mirror = 'ticks'),
+         xaxis = list(title = "Control Stores", showline = TRUE, mirror = 'ticks'),
+         xaxis2 = list(title = "Control Stores", showline = TRUE, mirror = 'ticks'),
+         xaxis3 = list(title = "Control Stores", showline = TRUE, mirror = 'ticks'),
+         xaxis4 = list(title = "Control Stores", showline = TRUE, mirror = 'ticks'))
+
+```
+
+Weekly Performance
+=====================================
+
+```{r}
+datS <- order_data[, list(DEL_DATE = min(DEL_DATE, na.rm = TRUE), 
+                   ORDER_VOL = as.numeric(sum(ORDER_VOL, na.rm = TRUE)), 
+                   DEL_REVENUE = sum(DEL_REVENUE, na.rm = TRUE)), by = c("WEEK_ID", "STORE_TYPE")]
+datS[, `Del. Revenue` := (DEL_REVENUE - head(DEL_REVENUE, 1)) / head(DEL_REVENUE, 1) * 100, by = "STORE_TYPE"]
+datS[, `Order Volume` := (ORDER_VOL - head(ORDER_VOL, 1)) / head(ORDER_VOL, 1) * 100, by = "STORE_TYPE"]
+datS$DEL_REVENUE <- NULL
+datS$ORDER_VOL <- NULL
+datS <- melt(datS, id.vars = c("WEEK_ID", "STORE_TYPE", "DEL_DATE"), variable.name = "VAR", value.name = "NUM")
+
+ggplot(datS) +
+  facet_grid(~VAR) + 
+  geom_line(aes(x = DEL_DATE, y = NUM, color = STORE_TYPE)) + 
+  geom_point(aes(x = DEL_DATE, y = NUM, color = STORE_TYPE)) +
+  theme_bw(base_size = 16) + 
+  geom_hline(yintercept = 0) + 
+  labs(x = "Week", y = "% Weekly Change", color = "Group")+
+  scale_color_manual(labels = c("Control", "Simple", "Elastic"), values = c("red", "dodgerblue1", "darkblue")) + 
+  theme(legend.position = "bottom") +
+  scale_fill_gradient(low = "green", high = "darkgreen") +
+  scale_x_date(breaks = unique(datS$DEL_DATE)) +
+  guides(fill=FALSE) 
 
 ```
 
@@ -147,83 +265,89 @@ Weekly Price Benchmarking
 =====================================
 
 ```{r}
+data <- order_data[, list(ORDER_VOL = sum(ORDER_VOL, na.rm = TRUE), SLOT_PRICE = median(SLOT_PRICE, na.rm = TRUE)), 
+                 by = c("WEEK_ID", "DEL_DATE", "DEL_DOW", "DEL_SLOT_RND", "SLOT_STATUS", "STORE_TYPE", "STORE_NUM")][
+                   , list(ORDER_VOL = sum(ORDER_VOL, na.rm = TRUE), SLOT_PRICE = median(SLOT_PRICE, na.rm = TRUE), STORES = .N), 
+                   by = c("WEEK_ID", "DEL_DATE", "DEL_DOW", "DEL_SLOT_RND", "SLOT_STATUS", "STORE_TYPE")][, STORES := max(STORES), by = "STORE_TYPE"]
 
-  data <- order_data[, list(SLOT_PRICE = median(SLOT_PRICE, na.rm = TRUE), ORDER_VOL = sum(ORDER_VOL, na.rm = TRUE)), 
-                     by = c("WEEK_ID", "DEL_DATE","DEL_DOW", "DEL_SLOT_RND", "SLOT_STATUS")]
+# Calculate the order type probability and sum the slot volume
+data[, ORDER_RATIO := ORDER_VOL / sum(ORDER_VOL, na.rm = TRUE), by = c("WEEK_ID","DEL_DATE","DEL_DOW","DEL_SLOT_RND", "STORE_TYPE") ]
+data[, ORDER_VOL := sum(ORDER_VOL, na.rm = TRUE), by = c("WEEK_ID","DEL_DATE","DEL_DOW","DEL_SLOT_RND", "STORE_TYPE") ]
 
-  # Calculate the order type probability and sum the slot volume
-  data[, ORDER_RATIO := ORDER_VOL / sum(ORDER_VOL, na.rm = TRUE), by = c("WEEK_ID","DEL_DATE","DEL_DOW","DEL_SLOT_RND") ]
-  data[, ORDER_VOL := sum(ORDER_VOL, na.rm = TRUE), by = c("WEEK_ID","DEL_DATE","DEL_DOW","DEL_SLOT_RND") ]
+# Pivot data to get slot status as column
+data <- dcast(data, WEEK_ID + DEL_DATE + DEL_DOW + DEL_SLOT_RND + STORE_TYPE + STORES + SLOT_PRICE + ORDER_VOL ~ SLOT_STATUS, 
+              value.var = "ORDER_RATIO", fill = 0)
 
-  # Pivot data to get slot status as column
-  data <- dcast(data, WEEK_ID + DEL_DATE + DEL_DOW + DEL_SLOT_RND + SLOT_PRICE + ORDER_VOL ~ SLOT_STATUS, value.var = "ORDER_RATIO", fill = 0)
+# Multiply Slot price with volume and ratio of paid deliveries to get revenue
+data[, REVENUE := round(SLOT_PRICE * PAID * ORDER_VOL)]
 
-  # Multiply Slot price with volume and ratio of paid deliveries to get revenue
-  data[, REVENUE := round(SLOT_PRICE * PAID * ORDER_VOL)]
+# Sort data in the appropriate way
+setorder(data, "WEEK_ID", "STORE_TYPE", "DEL_DATE", "DEL_DOW", "DEL_SLOT_RND")
 
-  # Sort data in the appropriate way
-  setorder(data, "WEEK_ID", "DEL_DATE", "DEL_DOW", "DEL_SLOT_RND")
+# remove the DP and FREE columns
+data[, DP := NULL]
+data[, FREE := NULL]
 
-  # remove the DP and FREE columns
-  data[, DP := NULL]
-  data[, FREE := NULL]
+# Calculate the neighbour order vol, revenue and ratio of paid orders by adding the slot before and after
+data[, TOT_ORDER_VOL := ORDER_VOL + c(0, head(ORDER_VOL, -1)) + c(tail(ORDER_VOL, -1), 0), by = c("WEEK_ID", "DEL_DATE", "DEL_DOW")]
+data[, TOT_REV := REVENUE + c(0, head(REVENUE, -1)) + c(tail(REVENUE, -1), 0), by = c("WEEK_ID", "DEL_DATE", "DEL_DOW")]
+data[, TOT_PAID := colMeans(rbind(PAID ,c(NA, head(PAID, -1)), c(tail(PAID, -1), NA)), na.rm = TRUE), by = c("WEEK_ID", "DEL_DATE", "DEL_DOW")]
 
-  # Calculate the neighbour order vol, revenue and ratio of paid orders by adding the slot before and after
-  data[, TOT_ORDER_VOL := ORDER_VOL + c(0, head(ORDER_VOL, -1)) + c(tail(ORDER_VOL, -1), 0), by = c("WEEK_ID", "DEL_DATE", "DEL_DOW")]
-  data[, TOT_REV := REVENUE + c(0, head(REVENUE, -1)) + c(tail(REVENUE, -1), 0), by = c("WEEK_ID", "DEL_DATE", "DEL_DOW")]
-  data[, TOT_PAID := colMeans(rbind(PAID ,c(NA, head(PAID, -1)), c(tail(PAID, -1), NA)), na.rm = TRUE), by = c("WEEK_ID", "DEL_DATE", "DEL_DOW")]
+# Copy the aggrData table and shift by a week
+dat_prev <- copy(data)
+dat_prev[, WEEK_ID := WEEK_ID + 1]
 
-  # Copy the aggrData table and shift by a week
-  dat_prev <- copy(data)
-  dat_prev[, WEEK_ID := WEEK_ID + 1]
+# inner join with last week's data - i.e. Remove non-mathching rows (use .pw suffix for the previous week of data)
+compareWeeklyData <- merge(data[STORE_TYPE == "Test"], data[STORE_TYPE == "Control"], by = c("WEEK_ID", "DEL_DOW", "DEL_SLOT_RND", "DEL_DATE"), suffixes = c(".test",".control"))
 
-  # inner join with last week's data - i.e. Remove non-mathching rows (use .pw suffix for the previous week of data)
-  compareWeeklyData <- merge(data[WEEK_ID > 1, ], dat_prev, by = c("WEEK_ID", "DEL_DOW", "DEL_SLOT_RND"), suffixes = c("",".pw"))
+# Reset week ID
+compareWeeklyData[, WEEK_ID := max(WEEK_ID, na.rm = TRUE) - WEEK_ID + 1]
 
-  # Reset week ID
-  compareWeeklyData[, WEEK_ID := max(WEEK_ID, na.rm = TRUE) - WEEK_ID + 1]
-  
-  # Calculate Price Change between the 2 weeks
-  compareWeeklyData[, PRICE_CHANGE := SLOT_PRICE - SLOT_PRICE.pw]
+# Calculate Price Change between the 2 weeks
+compareWeeklyData[, PRICE_CHANGE := SLOT_PRICE.test - SLOT_PRICE.control]
 
-  # Format dow accordingly 
-  compareWeeklyData[, DEL_DOW := factor(DEL_DOW, levels = c("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"))]
+# Format dow accordingly 
+compareWeeklyData[, DEL_DOW := factor(DEL_DOW, levels = c("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"))]
 
-  # Calculate changes in volume and revenue
-  compareWeeklyData[, CH_VOL := ORDER_VOL - ORDER_VOL.pw]
-  compareWeeklyData[, CH_REV := REVENUE - REVENUE.pw]
-  
-  # Create figure labels
-  compareWeeklyData[, WEEK_LBL := paste0("Week ", WEEK_ID, " - ", min(DEL_DATE), " to ", 
-                                         lubridate::ceiling_date(as.Date(max(DEL_DATE)), unit = "week", change_on_boundary = FALSE) - 
-                                           lubridate::days(1)), by = "WEEK_ID"]
-  
-  # Calculate day stats to show on the plot
-  dayStats <- compareWeeklyData[, list(VOL = sum(ORDER_VOL, na.rm = TRUE), 
-                                       REV = sum(REVENUE, na.rm = TRUE),
-                                       VOLP = sum(ORDER_VOL.pw, na.rm = TRUE),
-                                       CH_VOL = sum(ORDER_VOL, na.rm = TRUE) - sum(ORDER_VOL.pw, na.rm = TRUE),
-                                       CH_REV = sum(REVENUE, na.rm = TRUE) - sum(REVENUE.pw, na.rm = TRUE)), by = c("WEEK_ID", "WEEK_LBL", "DEL_DOW")]
-  
-  # Visualise the weekly price comparisons
-  ggplot(compareWeeklyData) +
+# Calculate changes in volume and revenue
+compareWeeklyData[, CH_VOL := ORDER_VOL.test / STORES.test - ORDER_VOL.control / STORES.control]
+compareWeeklyData[, CH_REV := REVENUE.test / STORES.test - REVENUE.control / STORES.control]
+
+# Create figure labels
+compareWeeklyData[, WEEK_LBL := paste0("Week ", WEEK_ID, " - ", min(DEL_DATE), " to ", 
+                                       lubridate::ceiling_date(as.Date(max(DEL_DATE)), unit = "week", change_on_boundary = FALSE) - 
+                                         lubridate::days(1)), by = "WEEK_ID"]
+
+# Calculate day stats to show on the plot
+dayStats <- compareWeeklyData[, list(VOL.t = round(sum(ORDER_VOL.test / STORES.test, na.rm = TRUE)), 
+                                     REV.t = round(sum(REVENUE.test / STORES.test, na.rm = TRUE)),
+                                     VOL.c = round(sum(ORDER_VOL.control / STORES.control, na.rm = TRUE)), 
+                                     REV.c = round(sum(REVENUE.control / STORES.control, na.rm = TRUE)),
+                                     CH_VOL = sum(ORDER_VOL.test / STORES.test, na.rm = TRUE) - sum(ORDER_VOL.control / STORES.control, na.rm = TRUE),
+                                     CH_REV = sum(REVENUE.test / STORES.test, na.rm = TRUE) - sum(REVENUE.control / STORES.control, na.rm = TRUE)), 
+                              by = c("WEEK_ID", "WEEK_LBL", "DEL_DOW")]
+
+# Visualise the weekly price comparisons
+ggplot(compareWeeklyData) +
   facet_grid(DEL_DOW ~ WEEK_LBL) +
-  geom_point(aes(x = as.numeric(DEL_SLOT_RND)-0.1, y = CH_VOL), color = "blue", na.rm = TRUE) + 
-  geom_segment(aes(x = as.numeric(DEL_SLOT_RND)-0.1, y = CH_VOL, xend=as.numeric(DEL_SLOT_RND)-0.1, yend=0),  color = "blue", na.rm = TRUE) +
-  geom_point(aes(x = as.numeric(DEL_SLOT_RND)+0.1, y = CH_REV), color = "magenta", na.rm = TRUE) +
-  geom_segment(aes(x = as.numeric(DEL_SLOT_RND)+0.1, y = CH_REV, xend=as.numeric(DEL_SLOT_RND)+0.1, yend=0),  color = "magenta", na.rm = TRUE) +
-  geom_text(aes(x = as.numeric(DEL_SLOT_RND), y = max(c(compareWeeklyData$CH_VOL,compareWeeklyData$CH_REV),na.rm = T) + 20, 
-                label = paste0("£", SLOT_PRICE), 
+  geom_point(aes(x = as.numeric(DEL_SLOT_RND) - 0.1, y = CH_VOL), color = "blue", na.rm = TRUE) + 
+  geom_segment(aes(x = as.numeric(DEL_SLOT_RND) - 0.1, y = CH_VOL, xend = as.numeric(DEL_SLOT_RND) - 0.1, 
+                   yend = 0),  color = "blue", na.rm = TRUE) +
+  geom_point(aes(x = as.numeric(DEL_SLOT_RND) + 0.1, y = CH_REV), color = "magenta", na.rm = TRUE) +
+  geom_segment(aes(x = as.numeric(DEL_SLOT_RND) + 0.1, y = CH_REV, xend = as.numeric(DEL_SLOT_RND) + 0.1, yend = 0),  
+               color = "magenta", na.rm = TRUE) +
+  geom_text(aes(x = as.numeric(DEL_SLOT_RND), y = max(c(compareWeeklyData$CH_VOL, compareWeeklyData$CH_REV), na.rm = TRUE) + 2, 
+                label = paste0("£", SLOT_PRICE.test), 
                 color = factor(ifelse( PRICE_CHANGE > 0, 1, ifelse(PRICE_CHANGE < 0, -1, 0)))), fontface = "bold", show.legend = FALSE, na.rm = TRUE) +
-  geom_text(data = dayStats,aes(label = paste0("Day Total - Vol: ", VOL, " - Rev: £", REV)), 
-    y = min(c(compareWeeklyData$CH_VOL,compareWeeklyData$CH_REV),na.rm = T) + 20,
-    x = 7+(22-7)/2, hjust = "center", fontface = "bold") +
+  geom_text(data = dayStats,aes(label = paste0("Test - Vol: ", VOL.t, " - Rev: £", REV.t, "  Control - Vol: ", VOL.c, " - Rev: £", REV.c)), 
+            y = min(c(compareWeeklyData$CH_VOL, compareWeeklyData$CH_REV), na.rm = TRUE) + 1,
+            x = 7 + (22 - 7) / 2, hjust = "center", fontface = "bold") +
   scale_colour_manual(values = c("-1" = "green", "0" = "black", "1" = "red", "orange")) +
   theme_bw(base_size = 16) +
   theme(panel.spacing = unit(0.05, "lines"), panel.grid.major.x = element_blank(), panel.grid.minor.y = element_blank()) +
-  labs(x = "Delivery Slot", y = "Change in Order Volume / Delivery Revenue [£] from Previous Week", fill = "Week") +
-  theme(legend.position="bottom") + 
-  scale_x_continuous(limits = c(7.5,21.5), breaks = 7:22) +
+  labs(x = "Delivery Slot", y = "Change in Order Volume / Delivery Revenue [£] against Control", fill = "Week") +
+  theme(legend.position = "bottom") + 
+  scale_x_continuous(limits = c(7.5, 21.5), breaks = 7:22) +
   geom_hline(yintercept = 0, linetype = "dashed")
 
 ```
@@ -233,8 +357,8 @@ Price Changes Benchmarking
 
 ```{r}
 slot_changes <- compareWeeklyData[PRICE_CHANGE != 0]
-slot_changes[, VOL_PERF := ORDER_VOL - ORDER_VOL.pw]
-slot_changes[, REV_PERF := REVENUE - REVENUE.pw]
+slot_changes[, VOL_PERF := ORDER_VOL.test - ORDER_VOL.control]
+slot_changes[, REV_PERF := REVENUE.test - REVENUE.control]
 
 plot_ly(slot_changes, 
         x = ~VOL_PERF, 
@@ -243,7 +367,7 @@ plot_ly(slot_changes,
         mode = "markers", 
         type = "scatter",
         text = ~paste0("Week ", WEEK_ID, " </br>", DEL_DOW, " ", DEL_SLOT_RND, ":00 </br>£", 
-                       sprintf("%.2f", SLOT_PRICE.pw), " to £", sprintf("%.2f", SLOT_PRICE)), 
+                       sprintf("%.2f", SLOT_PRICE.control), " to £", sprintf("%.2f", SLOT_PRICE.test)), 
         colors = c("darkgreen", "green", "orange", "red")) %>%
   layout(xaxis = list(title = "Volume Change"),
          yaxis = list(title = "Revenue Change [£]"),
@@ -256,8 +380,8 @@ Overall Price Changes Benchmarking
 
 ```{r}
 slot_changes <- compareWeeklyData[PRICE_CHANGE != 0]
-slot_changes[, VOL_PERF := TOT_ORDER_VOL - TOT_ORDER_VOL.pw]
-slot_changes[, REV_PERF := TOT_REV - TOT_REV.pw]
+slot_changes[, VOL_PERF := TOT_ORDER_VOL.test / STORES.test - TOT_ORDER_VOL.control / STORES.control]
+slot_changes[, REV_PERF := TOT_REV.test / STORES.test - TOT_REV.control / STORES.control]
 
 plot_ly(slot_changes, 
         x = ~VOL_PERF, 
@@ -266,7 +390,7 @@ plot_ly(slot_changes,
         mode = "markers", 
         type = "scatter",
         text = ~paste0("Week ", WEEK_ID, " </br>", DEL_DOW, " ", DEL_SLOT_RND, ":00 </br>£", 
-                       sprintf("%.2f", SLOT_PRICE.pw), " to £", sprintf("%.2f", SLOT_PRICE)), 
+                       sprintf("%.2f", SLOT_PRICE.control), " to £", sprintf("%.2f", SLOT_PRICE.test)), 
         colors = c("darkgreen", "green", "orange", "red")) %>%
   layout(xaxis = list(title = "Volume Change"),
          yaxis = list(title = "Revenue Change [£]"),
